@@ -1,8 +1,12 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib, os, warnings
-warnings.filterwarnings("ignore")
+import joblib, os
+from pathlib import Path
+from project_paths import ORIGINAL_MODELS
+from churn_features import build_admission_features, rebuild_features
+from churn_pipeline import PipelineStore, legacy_test_data
+from training_ui import render_training_page, render_batch_prediction
 
 def lazy_import_sklearn():
     global train_test_split, accuracy_score, f1_score, roc_auc_score
@@ -14,12 +18,10 @@ def lazy_import_sklearn():
 
 import plotly.express as px
 import plotly.graph_objects as go
-import shap
-import matplotlib.pyplot as plt
 
-FOLDER = r""
+FOLDER = str(ORIGINAL_MODELS)
 
-st.set_page_config(page_title=" Interpretable Student Churn Prediction Using Machine Learning with Adaptive Semester Weighting", layout="wide",
+st.set_page_config(page_title="Interpretable Student Churn Prediction Using Machine Learning with Adaptive Semester Weighting", layout="wide",
                    initial_sidebar_state="expanded")
 
 GOLD = "#C8A96E"
@@ -176,6 +178,10 @@ details summary{{cursor:pointer;padding:10px 14px;background:{NAVY};color:{GOLD}
 details summary:hover{{background:rgba(28,43,58,0.9);}}
 details summary::-webkit-details-marker{{display:none;}}
 details[open] summary{{border-bottom:2px solid {GOLD};}}
+/* Replace only the native expander arrow; keep existing text and theme. */
+[data-testid="stExpander"] summary [data-testid="stIconMaterial"]{{font-size:0!important;letter-spacing:0!important;transform:none!important;flex:0 0 1.25rem;width:1.25rem;}}
+[data-testid="stExpander"] summary [data-testid="stIconMaterial"]::before{{content:"▸";font-family:Arial,sans-serif!important;font-size:18px;line-height:1;}}
+[data-testid="stExpander"] details[open] summary [data-testid="stIconMaterial"]::before{{content:"▾";}}
 details .insight-body{{background:#FFF;border:1px solid #D4C5A9;border-top:none;padding:14px 16px;font-size:13px;color:#2C3E50;line-height:1.85;}}
 code{{background:#F5F2EB;padding:2px 6px;color:{NAVY};font-size:12px;border-radius:2px;border:1px solid #E5DCC8;}}
 [data-testid="stForm"]{{border:2px solid {GOLD}!important;background:#FFF!important;padding:16px!important;}}
@@ -260,45 +266,6 @@ SEM_LABELS = {
 }
 
 # ── FEATURE ENGINEERING ────────────────────────────────────
-def build_admission_features(exam_pct, gender, college, year_gap,
-                              spec, board, caste, religion, district):
-    gen  = 0 if gender=="Male" else 1
-    col  = 0 if "BPCCS" in college else 1
-    fees = 18000 if "BPCCS" in college else 27000
-    obc  = 1 if caste=="OBC" else 0
-    sct  = 1 if caste=="SCST" else 0
-    sbc  = 1 if caste=="SEBC" else 0
-    opn  = 1 if caste=="OPEN" else 0
-    mus  = 1 if religion=="Muslim" else 0
-    hin  = 1 if religion=="Hindu" else 0
-    sci  = 1 if spec=="SCIENCE" else 0
-    art  = 1 if spec=="ARTS" else 0
-    com  = 1 if spec=="COMMERCE" else 0
-    cbse = 1 if "CBSE" in board.upper() else 0
-    gseb = 1 if any(x in board.upper() for x in ["GSEB","GHSEB","G.H.S.E.B","G.S.E.B"]) else 0
-    dh   = 1 if district in HIGH_CHURN_DISTS else 0
-    dl   = 1 if district in LOCAL_DISTS else 0
-    pdev = exam_pct - 61.5
-    pdz  = 1 if 50<=exam_pct<65 else 0
-    pvl  = 1 if exam_pct<45 else 0
-    rs   = min(5, obc+sci+art+dh+mus+pdz+cbse)
-    return {
-        'exam_pct': exam_pct, 'pct_sq': (exam_pct/100)**2,
-        'pct_dev': pdev, 'pct_dev_sq': pdev**2,
-        'pct_danger': pdz, 'pct_very_low': pvl,
-        'gender': gen, 'college': col, 'fees': fees, 'year_gap': year_gap,
-        'cast_obc': obc, 'cast_scst': sct, 'cast_sebc': sbc, 'cast_open': opn,
-        'rel_muslim': mus, 'rel_hindu': hin,
-        'spec_science': sci, 'spec_arts': art, 'spec_commerce': com,
-        'board_cbse': cbse, 'board_gseb': gseb,
-        'dist_high': dh, 'dist_local': dl,
-        'pct_x_obc': exam_pct*obc, 'pct_x_science': exam_pct*sci,
-        'pct_x_dist': exam_pct*dh, 'pct_x_college': exam_pct*col,
-        'bpccs_obc': (1-col)*obc, 'female_svics': gen*col,
-        'obc_science': obc*sci,
-        'risk_score': rs, 'risk_x_pct': rs*exam_pct,
-    }
-
 def apply_semester_signal(base_prob, semester, sem_weight=None):
     if semester >= 4:
         return base_prob
@@ -308,95 +275,43 @@ def apply_semester_signal(base_prob, semester, sem_weight=None):
     combined = (1 - weight) * base_prob + weight * sem_signal
     return float(np.clip(combined, 0.0, 1.0))
 
-def rebuild_features(raw_df):
-    df = raw_df.copy()
-    df['exam_pct']   = df['Last Exam Percentage'].fillna(df['Last Exam Percentage'].median())
-    df['gender']     = (df['Gender']=='Female').astype(int)
-    df['college']    = (df['Institute']=='SVICS-G').astype(int)
-    df['fees']       = df['Total Fees'].fillna(df['Total Fees'].median())
-    df['cast_obc']   = (df['Admission Cast Category']=='OBC').astype(int)
-    df['cast_scst']  = (df['Admission Cast Category']=='SCST').astype(int)
-    df['cast_sebc']  = (df['Admission Cast Category']=='SEBC').astype(int)
-    df['cast_open']  = (df['Admission Cast Category']=='OPEN').astype(int)
-    df['rel_muslim'] = (df['Religion']=='Muslim').astype(int)
-    df['rel_hindu']  = (df['Religion']=='Hindu').astype(int)
-    df['spec_science']  = (df['Specialisation']=='SCIENCE').astype(int)
-    df['spec_arts']     = (df['Specialisation']=='ARTS').astype(int)
-    df['spec_commerce'] = (df['Specialisation']=='COMMERCE').astype(int)
-    def pg(s):
-        try: return max(1,min(5,2024-int(str(s).split('-')[0])))
-        except: return 1
-    df['year_gap'] = df['Last Exam Passing'].apply(pg)
-    bs = df['Last Exam Board/Uni.'].str.upper().fillna('')
-    df['board_cbse'] = bs.str.contains('CBSE',na=False).astype(int)
-    df['board_gseb'] = bs.str.contains('GSEB|GHSEB|G.H.S.E.B|G.S.E.B',na=False).astype(int)
-    df['dist_high']  = df['Permanent District'].isin(HIGH_CHURN_DISTS).astype(int)
-    df['dist_local'] = df['Permanent District'].isin(LOCAL_DISTS).astype(int)
-    df['pct_dev']    = df['exam_pct'] - 61.5
-    df['pct_dev_sq'] = df['pct_dev']**2
-    df['pct_danger'] = ((df['exam_pct']>=50)&(df['exam_pct']<65)).astype(int)
-    df['pct_very_low'] = (df['exam_pct']<45).astype(int)
-    df['pct_sq']       = (df['exam_pct']/100)**2
-    df['pct_x_obc']    = df['exam_pct']*df['cast_obc']
-    df['pct_x_science']= df['exam_pct']*df['spec_science']
-    df['pct_x_dist']   = df['exam_pct']*df['dist_high']
-    df['pct_x_college']= df['exam_pct']*df['college']
-    df['bpccs_obc']    = (1-df['college'])*df['cast_obc']
-    df['female_svics'] = df['gender']*df['college']
-    df['obc_science']  = df['cast_obc']*df['spec_science']
-    df['risk_score']   = (df['cast_obc']+df['spec_science']+df['spec_arts']+
-                          df['dist_high']+df['rel_muslim']+
-                          df['pct_danger']+df['board_cbse']).clip(0,5)
-    df['risk_x_pct']   = df['risk_score']*df['exam_pct']
-    return df
-
 # ── DATA & MODEL LOADING ───────────────────────────────────
 @st.cache_data
-def load_raw():
-    df = pd.read_csv(os.path.join(FOLDER,"latest.csv"))
-
-    # Clean values that may appear as "undefined" in Streamlit / Plotly.
-    # This only standardises missing text values and does not change model logic.
-    text_cols = df.select_dtypes(include=["object", "string"]).columns
-    if len(text_cols) > 0:
-        df[text_cols] = df[text_cols].replace(
-            to_replace=r"(?i)^\s*(undefined|null|none|nan|n/a|na)?\s*$",
-            value=np.nan,
-            regex=True
-        )
-        df[text_cols] = df[text_cols].fillna("Unknown")
-
-    df["is_churned"]  = df["student_status_new"].apply(
-        lambda x: 1 if "dropout" in str(x).lower() and "sem1" in str(x).lower() else 0)
-    df["Churn Label"] = df["is_churned"].map({0:"Active",1:"Churned"})
+def load_raw(dataset_version):
+    df = PipelineStore().dataset(dataset_version)
+    df["Churn Label"] = df["is_churned"].map({0: "Active", 1: "Churned"}).fillna("Pending")
     return df
 
 @st.cache_resource
-def load_model():
-    m   = joblib.load(os.path.join(FOLDER,"churn_model.pkl"))
-    sc  = joblib.load(os.path.join(FOLDER,"churn_scaler.pkl"))
-    th  = joblib.load(os.path.join(FOLDER,"churn_threshold.pkl"))
-    ft  = joblib.load(os.path.join(FOLDER,"churn_feature_names.pkl"))
-    sw  = joblib.load(os.path.join(FOLDER,"churn_sem_weight.pkl"))
+def load_model(model_version):
+    if model_version:
+        bundle = PipelineStore().bundle(model_version)
+        return bundle["model"], bundle["scaler"], bundle["threshold"], bundle["features"], bundle["semester_rates"]
+    m = joblib.load(os.path.join(FOLDER, "churn_model.pkl"))
+    sc = joblib.load(os.path.join(FOLDER, "churn_scaler.pkl"))
+    th = joblib.load(os.path.join(FOLDER, "churn_threshold.pkl"))
+    ft = joblib.load(os.path.join(FOLDER, "churn_feature_names.pkl"))
+    sw = joblib.load(os.path.join(FOLDER, "churn_sem_weight.pkl"))
     return m, sc, th, ft, sw
 
 @st.cache_data
-def get_test_set(feats_tuple):
+def get_test_set(feats_tuple, model_version, dataset_version):
     from sklearn.model_selection import train_test_split
-    raw   = load_raw()
-    df    = rebuild_features(raw)
-    df["is_churned"] = raw["is_churned"].values
-    y     = df["is_churned"]
-    X     = df[list(feats_tuple)]
-    sems  = raw["Current Semester"]
-    Xtr,Xte,ytr,yte,str_,ste = train_test_split(
-        X, y, sems, test_size=0.30, random_state=42, stratify=y)
-    return Xte, yte, ste
+    if model_version:
+        test = PipelineStore().bundle(model_version)["test_data"]
+        return rebuild_features(test)[list(feats_tuple)], test["is_churned"].astype(int), test["Current Semester"]
+    test = legacy_test_data()
+    return rebuild_features(test)[list(feats_tuple)], test["is_churned"].astype(int), test["Current Semester"]
 
 try:
-    raw = load_raw()
-    model, scaler, thresh, feats, sem_weight = load_model()
-    X_test, y_test, sem_test = get_test_set(tuple(feats))
+    pipeline_store = PipelineStore()
+    dataset_version = pipeline_store.dataset_version()
+    model_version = pipeline_store.active_version()
+    raw = load_raw(dataset_version).dropna(subset=["is_churned"])
+    model, scaler, thresh, feats, sem_weight = load_model(model_version)
+    if model_version:
+        SEM_HIST_RATE = sem_weight
+    X_test, y_test, sem_test = get_test_set(tuple(feats), model_version, dataset_version)
     Xs_test    = scaler.transform(X_test)
     base_probs = model.predict_proba(Xs_test)[:,1]
     all_probs  = np.array([apply_semester_signal(p, s) for p, s in zip(base_probs, sem_test.values)])
@@ -409,9 +324,7 @@ try:
 except Exception as e:
     LOADED = False
     ERR = str(e)
-    ACTUAL_ACC = 0.854
-    ACTUAL_AUC = 0.752
-    ACTUAL_F1 = 0.464
+    ACTUAL_ACC = ACTUAL_AUC = ACTUAL_F1 = None
 
 # ── SIDEBAR ────────────────────────────────────────────────
 with st.sidebar:
@@ -422,9 +335,10 @@ with st.sidebar:
       <div style='font-size:10px;color:#8FA3B8;margin-top:4px;letter-spacing:2.5px;
            text-transform:uppercase'>Analysis Project</div></div>""", unsafe_allow_html=True)
     st.markdown("<br>",unsafe_allow_html=True)
-    page = st.radio("",[
+    page = st.radio("Navigation",[
         "I.    Introduction","II.   Dataset Overview","III.  Data Cleaning",
-        "IV.   EDA","V.    Feature Engineering","VI.   Model & Prediction"],
+        "IV.   EDA","V.    Feature Engineering","VI.   Model & Prediction",
+        "VII.  Data & Training", "VIII. CSV Predictions"],
         label_visibility="collapsed")
     if LOADED:
         st.markdown("<br>",unsafe_allow_html=True)
@@ -438,9 +352,27 @@ with st.sidebar:
           <span style='color:{GOLD}'>&#9632;</span>&nbsp; (S1:20%, S2:15%, S3:5%)</div>""",
             unsafe_allow_html=True)
 
-if not LOADED:
-    st.error(f"Cannot load model from {FOLDER}. Copy all 5 pkl files.\n\n{ERR}")
+if 'CSV Predictions' in page:
+    render_batch_prediction()
     st.stop()
+
+if "Data & Training" in page:
+    render_training_page()
+    st.stop()
+
+if not LOADED:
+    st.error(f"The prediction model could not be loaded: {ERR}")
+    st.info("Open Data & Training in the sidebar to save historical data, train, and activate a new model.")
+    st.stop()
+
+if not model_version:
+    st.warning("Legacy model: displayed scores are a reconstructed split, not verified held-out performance. "
+               "Use Data & Training to train and activate a versioned model with a frozen test cohort.")
+else:
+    st.caption(f"Active model: {model_version} · Evaluation: frozen test cohort saved with this model. "
+               "Dataset and EDA pages show labeled records only; pending records are in Data & Training.")
+st.caption("Target: first-semester dropout. Class 0 includes later dropout. Narrative examples on the "
+           "original analysis pages describe the 2023–24 cohort; Data & Training reports are version-specific.")
 
 # ================================================================
 #  I. INTRODUCTION
@@ -448,11 +380,11 @@ if not LOADED:
 if "Introduction" in page:
     st.title("Interpretable Student Churn Prediction Using Machine Learning with Adaptive Semester Weighting")
     st.markdown("<p style='font-size:15px;color:#5C6B7A;font-style:italic;margin-bottom:20px'>"
-                "Predicting student dropout in BCA using machine learning -- Batch 2023-24.</p>",
+                "Predicting student dropout in BCA using machine learning -- historical and updated student outcomes.</p>",
                 unsafe_allow_html=True)
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Total Students","842"); c2.metric("Active","735")
-    c3.metric("Churned","107");        c4.metric("Churn Rate","12.7%")
+    c1.metric("Labeled Students", len(raw)); c2.metric("No First-semester Dropout", int((raw.is_churned == 0).sum()))
+    c3.metric("First-semester Dropout", int(raw.is_churned.sum())); c4.metric("Churn Rate", f"{raw.is_churned.mean():.1%}")
     st.divider()
 
     st.markdown(f"""<div style='background:{NAVY};border:2px solid {GOLD};padding:16px 20px;margin-bottom:20px'>
@@ -480,13 +412,13 @@ if "Introduction" in page:
     with col_l:
         section_header("How the Model Works")
         info_card(f"""The model combines two complementary signals:<br><br>
-          <b>Admission data model (80-95%):</b> Random Forest trained on 32 features
+          <b>Admission data model (80-95%):</b> {type(model).__name__} trained on 32 features
           known at enrollment -- HSC percentage, caste, stream, district, board,
           religion, gender, and college.<br><br>
           <b>Adaptive semester signal (5-20%):</b> Applied only for Semesters 1-3:<br>
-          &bull; Sem 1: 20% weight (100% historical churn)<br>
-          &bull; Sem 2: 15% weight (75-93% historical churn)<br>
-          &bull; Sem 3: 5% weight (&lt;3% historical churn)<br>
+          &bull; Sem 1: 20% weight (model-version semester rate)<br>
+          &bull; Sem 2: 15% weight (model-version semester rate)<br>
+          &bull; Sem 3: 5% weight (model-version semester rate)<br>
           &bull; Sem 4-6: 0% weight (admission model only)<br><br>
           Combined result: <b>{ACTUAL_ACC*100:.1f}% accuracy, AUC {ACTUAL_AUC:.3f}</b>""", color=GOLD)
 
@@ -774,7 +706,7 @@ elif "Cleaning" in page:
 elif "EDA" in page:
     st.title("Exploratory Data Analysis")
     st.markdown("<p style='font-size:14px;color:#5C6B7A;font-style:italic'>"
-                "All charts use raw data from latest.csv with real semester values 1-6.</p>",
+                "Charts use the current labeled dataset with semester values 1-6.</p>",
                 unsafe_allow_html=True)
 
     section_banner("SECTION A  --  UNIVARIATE ANALYSIS")
@@ -1068,7 +1000,7 @@ elif "EDA" in page:
 
     with b3:
         section_header("Semester-Wise Analysis (Real Data)")
-        info_card(f"""<b style='color:{NAVY}'>Note:</b> These charts use actual semester values 1-6 from latest.csv, 
+        info_card(f"""<b style='color:{NAVY}'>Note:</b> These charts use actual semester values 1-6 from the current labeled dataset,
                   showing the true distribution of students and churn across semesters.""", color=GOLD)
         sem_d=raw.groupby("Current Semester").agg(
             Students=("is_churned","count"),Churned=("is_churned","sum")).reset_index()
@@ -1202,7 +1134,7 @@ elif "Model" in page:
     st.title("Model & Prediction")
     st.markdown(f"""<p style='font-size:14px;color:#5C6B7A;font-style:italic'>
       {type(model).__name__} | 32 features + adaptive semester signal |
-      Accuracy {ACTUAL_ACC*100:.1f}% | AUC {ACTUAL_AUC:.3f} | F1 {ACTUAL_F1:.3f} | 70/30 split</p>""",
+      Accuracy {ACTUAL_ACC*100:.1f}% | AUC {ACTUAL_AUC:.3f} | F1 {ACTUAL_F1:.3f} | saved evaluation cohort</p>""",
         unsafe_allow_html=True)
     t1,t2,t3=st.tabs(["  Model Performance  ","  Predict a Student  ","  All Test Predictions  "])
 
@@ -1215,7 +1147,7 @@ elif "Model" in page:
         prec=precision_score(y_test,all_preds,zero_division=0)
         rec =recall_score(y_test,all_preds,zero_division=0)
 
-        section_header("Evaluation Metrics -- 30% Hold-out Test Set")
+        section_header("Evaluation Metrics -- Saved Test Cohort")
         m1,m2,m3,m4,m5=st.columns(5)
         m1.metric("Accuracy",f"{acc*100:.1f}%"); m2.metric("ROC-AUC",f"{auc:.3f}")
         m3.metric("F1 Score",f"{f1:.3f}");       m4.metric("Recall",f"{rec:.1%}")
@@ -1300,261 +1232,265 @@ elif "Model" in page:
                 This makes the Random Forest model easier to understand instead of treating it only as a black-box model.
             </div>""", unsafe_allow_html=True)
 
-        try:
-            with st.spinner("Computing SHAP values..."):
+        if st.checkbox("Show SHAP explanations", key="show_shap"):
+            try:
+                with st.spinner("Computing SHAP values..."):
+                    import shap
+                    import matplotlib.pyplot as plt
 
-                # ---------------------------------------------------------
-                # 1. Take a sample from test data
-                # ---------------------------------------------------------
-                sample_size = min(150, len(X_test))
+                    # ---------------------------------------------------------
+                    # 1. Take a sample from test data
+                    # ---------------------------------------------------------
+                    sample_size = min(150, len(X_test))
 
-                sample_indices = np.random.RandomState(42).choice(
-                    len(X_test),
-                    sample_size,
-                    replace=False
-                )
+                    sample_indices = np.random.RandomState(42).choice(
+                        len(X_test),
+                        sample_size,
+                        replace=False
+                    )
 
-                X_sample = X_test.iloc[sample_indices].copy()
-
-
-                # ---------------------------------------------------------
-                # 2. Scale data exactly as model expects
-                # ---------------------------------------------------------
-                X_sample_scaled = scaler.transform(X_sample)
-
-                # Convert back to DataFrame so feature names are preserved
-                X_sample_scaled_df = pd.DataFrame(
-                    X_sample_scaled,
-                    columns=X_sample.columns,
-                    index=X_sample.index
-                )
+                    X_sample = X_test.iloc[sample_indices].copy()
 
 
-                # ---------------------------------------------------------
-                # 3. Create SHAP TreeExplainer
-                # ---------------------------------------------------------
-                explainer = shap.TreeExplainer(model)
+                    # ---------------------------------------------------------
+                    # 2. Scale data exactly as model expects
+                    # ---------------------------------------------------------
+                    X_sample_scaled = scaler.transform(X_sample)
 
-                shap_values = explainer.shap_values(X_sample_scaled_df)
+                    # Convert back to DataFrame so feature names are preserved
+                    X_sample_scaled_df = pd.DataFrame(
+                        X_sample_scaled,
+                        columns=X_sample.columns,
+                        index=X_sample.index
+                    )
 
 
-                # ---------------------------------------------------------
-                # 4. FIX SHAP OUTPUT SHAPE
-                # ---------------------------------------------------------
-
-                # Older SHAP:
-                # [class_0_array, class_1_array]
-                if isinstance(shap_values, list):
-
-                    if len(shap_values) == 2:
-                        shap_values_churn = shap_values[1]
+                    # ---------------------------------------------------------
+                    # 3. Create SHAP TreeExplainer
+                    # ---------------------------------------------------------
+                    if hasattr(model, "coef_"):
+                        explainer = shap.LinearExplainer(model, X_sample_scaled_df)
                     else:
-                        shap_values_churn = shap_values[0]
+                        explainer = shap.TreeExplainer(model)
 
-                else:
-                    shap_values = np.asarray(shap_values)
+                    shap_values = explainer.shap_values(X_sample_scaled_df)
 
-                    # Newer SHAP RandomForest output:
-                    # (samples, features, classes)
-                    if shap_values.ndim == 3:
 
-                        # Select class 1 = Churned
-                        if shap_values.shape[2] >= 2:
-                            shap_values_churn = shap_values[:, :, 1]
+                    # ---------------------------------------------------------
+                    # 4. FIX SHAP OUTPUT SHAPE
+                    # ---------------------------------------------------------
+
+                    # Older SHAP:
+                    # [class_0_array, class_1_array]
+                    if isinstance(shap_values, list):
+
+                        if len(shap_values) == 2:
+                            shap_values_churn = shap_values[1]
                         else:
-                            shap_values_churn = shap_values[:, :, 0]
-
-                    elif shap_values.ndim == 2:
-
-                        shap_values_churn = shap_values
+                            shap_values_churn = shap_values[0]
 
                     else:
+                        shap_values = np.asarray(shap_values)
+
+                        # Newer SHAP RandomForest output:
+                        # (samples, features, classes)
+                        if shap_values.ndim == 3:
+
+                            # Select class 1 = Churned
+                            if shap_values.shape[2] >= 2:
+                                shap_values_churn = shap_values[:, :, 1]
+                            else:
+                                shap_values_churn = shap_values[:, :, 0]
+
+                        elif shap_values.ndim == 2:
+
+                            shap_values_churn = shap_values
+
+                        else:
+                            raise ValueError(
+                                f"Unexpected SHAP output shape: {shap_values.shape}"
+                            )
+
+
+                    # Force final SHAP matrix to proper 2D shape
+                    shap_values_churn = np.asarray(shap_values_churn)
+
+                    if shap_values_churn.ndim != 2:
+                        shap_values_churn = np.squeeze(shap_values_churn)
+
+                    if shap_values_churn.ndim != 2:
                         raise ValueError(
-                            f"Unexpected SHAP output shape: {shap_values.shape}"
+                            f"SHAP values could not be converted to 2D. "
+                            f"Current shape: {shap_values_churn.shape}"
                         )
 
 
-                # Force final SHAP matrix to proper 2D shape
-                shap_values_churn = np.asarray(shap_values_churn)
+                    # ---------------------------------------------------------
+                    # 5. SHAP BEESWARM / SUMMARY PLOT
+                    # ---------------------------------------------------------
+                    st.markdown(
+                        f"""
+                        <div style='font-size:14px;font-weight:600;
+                        color:{NAVY};margin:15px 0 10px 0'>
+                        SHAP Beeswarm Plot - Top 15 Features
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
 
-                if shap_values_churn.ndim != 2:
-                    shap_values_churn = np.squeeze(shap_values_churn)
+                    st.markdown("""
+                    <div style='font-size:12px;color:#666;margin-bottom:10px'>
+                        Each dot = one student |
+                        Left/Right position = impact on prediction |
+                        Color = feature value
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                if shap_values_churn.ndim != 2:
-                    raise ValueError(
-                        f"SHAP values could not be converted to 2D. "
-                        f"Current shape: {shap_values_churn.shape}"
+
+                    fig_shap = plt.figure(figsize=(10, 8))
+
+                    shap.summary_plot(
+                        shap_values_churn,
+                        X_sample_scaled_df,
+                        feature_names=list(X_sample.columns),
+                        plot_type="dot",
+                        max_display=15,
+                        show=False
+                    )
+
+                    plt.xlabel(
+                        "SHAP Value (Impact on Churn Prediction)",
+                        fontsize=11
+                    )
+
+                    plt.tight_layout()
+
+                    st.pyplot(plt.gcf(), use_container_width=True)
+
+                    plt.close("all")
+
+
+                    # ---------------------------------------------------------
+                    # 6. CALCULATE MEAN ABSOLUTE SHAP IMPORTANCE
+                    # ---------------------------------------------------------
+                    mean_shap = np.mean(
+                        np.abs(shap_values_churn),
+                        axis=0
+                    )
+
+                    # IMPORTANT:
+                    # Convert to a flat 1D array
+                    mean_shap = np.asarray(mean_shap).flatten()
+
+                    feature_names = list(X_sample.columns)
+
+
+                    # Check dimensions before making DataFrame
+                    if len(mean_shap) != len(feature_names):
+                        raise ValueError(
+                            f"Feature count mismatch: "
+                            f"{len(feature_names)} feature names but "
+                            f"{len(mean_shap)} SHAP importance values."
+                        )
+
+
+                    shap_importance = pd.DataFrame({
+                        "Feature": feature_names,
+                        "Importance": mean_shap
+                    })
+
+                    shap_importance = (
+                        shap_importance
+                        .sort_values("Importance", ascending=False)
+                        .head(10)
                     )
 
 
-                # ---------------------------------------------------------
-                # 5. SHAP BEESWARM / SUMMARY PLOT
-                # ---------------------------------------------------------
-                st.markdown(
-                    f"""
-                    <div style='font-size:14px;font-weight:600;
-                    color:{NAVY};margin:15px 0 10px 0'>
-                    SHAP Beeswarm Plot - Top 15 Features
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-                st.markdown("""
-                <div style='font-size:12px;color:#666;margin-bottom:10px'>
-                    Each dot = one student |
-                    Left/Right position = impact on prediction |
-                    Color = feature value
-                </div>
-                """, unsafe_allow_html=True)
-
-
-                fig_shap = plt.figure(figsize=(10, 8))
-
-                shap.summary_plot(
-                    shap_values_churn,
-                    X_sample_scaled_df,
-                    feature_names=list(X_sample.columns),
-                    plot_type="dot",
-                    max_display=15,
-                    show=False
-                )
-
-                plt.xlabel(
-                    "SHAP Value (Impact on Churn Prediction)",
-                    fontsize=11
-                )
-
-                plt.tight_layout()
-
-                st.pyplot(plt.gcf(), use_container_width=True)
-
-                plt.close("all")
-
-
-                # ---------------------------------------------------------
-                # 6. CALCULATE MEAN ABSOLUTE SHAP IMPORTANCE
-                # ---------------------------------------------------------
-                mean_shap = np.mean(
-                    np.abs(shap_values_churn),
-                    axis=0
-                )
-
-                # IMPORTANT:
-                # Convert to a flat 1D array
-                mean_shap = np.asarray(mean_shap).flatten()
-
-                feature_names = list(X_sample.columns)
-
-
-                # Check dimensions before making DataFrame
-                if len(mean_shap) != len(feature_names):
-                    raise ValueError(
-                        f"Feature count mismatch: "
-                        f"{len(feature_names)} feature names but "
-                        f"{len(mean_shap)} SHAP importance values."
+                    # ---------------------------------------------------------
+                    # 7. TOP 10 SHAP FEATURE IMPORTANCE
+                    # ---------------------------------------------------------
+                    st.markdown(
+                        f"""
+                        <div style='font-size:14px;font-weight:600;
+                        color:{NAVY};margin:20px 0 10px 0'>
+                        Top 10 Most Important Features by Mean |SHAP|
+                        </div>
+                        """,
+                        unsafe_allow_html=True
                     )
 
 
-                shap_importance = pd.DataFrame({
-                    "Feature": feature_names,
-                    "Importance": mean_shap
-                })
+                    fig_importance = go.Figure(
+                        go.Bar(
+                            x=shap_importance["Importance"],
+                            y=shap_importance["Feature"],
+                            orientation="h",
+                            marker=dict(
+                                color=shap_importance["Importance"],
+                                colorscale=[
+                                    [0, GREEN],
+                                    [0.5, AMBER],
+                                    [1, RED]
+                                ],
+                                showscale=False
+                            ),
+                            text=shap_importance["Importance"].round(4),
+                            textposition="outside",
+                            textfont=dict(size=11)
+                        )
+                    )
 
-                shap_importance = (
-                    shap_importance
-                    .sort_values("Importance", ascending=False)
-                    .head(10)
-                )
-
-
-                # ---------------------------------------------------------
-                # 7. TOP 10 SHAP FEATURE IMPORTANCE
-                # ---------------------------------------------------------
-                st.markdown(
-                    f"""
-                    <div style='font-size:14px;font-weight:600;
-                    color:{NAVY};margin:20px 0 10px 0'>
-                    Top 10 Most Important Features by Mean |SHAP|
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-
-                fig_importance = go.Figure(
-                    go.Bar(
-                        x=shap_importance["Importance"],
-                        y=shap_importance["Feature"],
-                        orientation="h",
-                        marker=dict(
-                            color=shap_importance["Importance"],
-                            colorscale=[
-                                [0, GREEN],
-                                [0.5, AMBER],
-                                [1, RED]
-                            ],
-                            showscale=False
+                    fig_importance.update_layout(
+                        title="",
+                        xaxis_title="Mean |SHAP Value| (Average Impact on Prediction)",
+                        yaxis_title="",
+                        yaxis=dict(
+                            categoryorder="total ascending",
+                            title=""
                         ),
-                        text=shap_importance["Importance"].round(4),
-                        textposition="outside",
-                        textfont=dict(size=11)
+                        height=430,
+                        showlegend=False,
+                        margin=dict(
+                            l=180,
+                            r=70,
+                            t=30,
+                            b=50
+                        )
                     )
-                )
 
-                fig_importance.update_layout(
-                    title="",
-                    xaxis_title="Mean |SHAP Value| (Average Impact on Prediction)",
-                    yaxis_title="",
-                    yaxis=dict(
-                        categoryorder="total ascending",
-                        title=""
-                    ),
-                    height=430,
-                    showlegend=False,
-                    margin=dict(
-                        l=180,
-                        r=70,
-                        t=30,
-                        b=50
+                    tnr(fig_importance, 430)
+
+                    st.plotly_chart(
+                        fig_importance,
+                        use_container_width=True
                     )
+
+
+                    # ---------------------------------------------------------
+                    # 8. SIMPLE EXPLANATION
+                    # ---------------------------------------------------------
+                    chart_insight(
+                        "How to Read SHAP Analysis",
+                        "Features with larger Mean |SHAP| values have a greater "
+                        "overall influence on the Random Forest predictions. "
+                        "In the beeswarm plot, values on the positive side push "
+                        "the model more toward churn, while values on the negative "
+                        "side push the prediction more toward active status."
+                    )
+
+
+            except Exception as e:
+
+                st.warning(f"SHAP explanations are unavailable in this environment: {e}. Predictions remain available.")
+
+                import traceback
+
+                with st.expander("Explanation dependency details"):
+                    st.code(traceback.format_exc())
+
+                st.info(
+                    "Install compatible SHAP dependencies to view explanations for the selected model."
                 )
-
-                tnr(fig_importance, 430)
-
-                st.plotly_chart(
-                    fig_importance,
-                    use_container_width=True
-                )
-
-
-                # ---------------------------------------------------------
-                # 8. SIMPLE EXPLANATION
-                # ---------------------------------------------------------
-                chart_insight(
-                    "How to Read SHAP Analysis",
-                    "Features with larger Mean |SHAP| values have a greater "
-                    "overall influence on the Random Forest predictions. "
-                    "In the beeswarm plot, values on the positive side push "
-                    "the model more toward churn, while values on the negative "
-                    "side push the prediction more toward active status."
-                )
-
-
-        except Exception as e:
-
-            st.error(
-                f"Could not generate SHAP analysis: {str(e)}"
-            )
-
-            import traceback
-
-            st.code(traceback.format_exc())
-
-            st.info(
-                "SHAP analysis requires a compatible tree-based model "
-                "such as Random Forest."
-            )
     with t2:
         section_header("Predict Churn Risk for a Student",
                         "32 admission features + adaptive semester signal")
@@ -1583,15 +1519,18 @@ elif "Model" in page:
             year_gap  =g1b.selectbox("Years Since 12th",[1,2,3,4,5])
             exam_pct  =g1c.number_input("HSC Percentage (%)",min_value=0.0,max_value=100.0,
                 value=61.5,step=0.5)
+            actual_fees = st.number_input("Total Fees", min_value=0.0, max_value=10000000.0,
+                value=18000.0 if college_key == "BPCCS" else 27000.0, step=500.0,
+                key=f"prediction_fees_{college_key}")
 
             sc1,sc2=st.columns([1,2])
             semester=sc1.selectbox("Current Semester",options=available_sems,
                 format_func=lambda x: SEM_LABELS[x])
             sem_clr={1:RED,2:AMBER,3:GREEN,4:GREEN,5:GREEN,6:GREEN}[semester]
             sem_msg={
-                1:"Semester 1 -- CRITICAL RISK. 100% historical churn. 20% weight applied.",
-                2:"Semester 2 -- HIGH RISK. 75-93% historical churn. 15% weight applied.",
-                3:"Semester 3 -- LOW RISK. <3% historical churn. 5% weight applied.",
+                1:"Semester 1 -- 20% semester signal; rate stored with the active model.",
+                2:"Semester 2 -- 15% semester signal; rate stored with the active model.",
+                3:"Semester 3 -- 5% semester signal; rate stored with the active model.",
                 4:"Semester 4 -- Stable. Only admission model used.",
                 5:"Semester 5 -- Stable. Only admission model used.",
                 6:"Semester 6 -- Stable. Only admission model used."
@@ -1618,6 +1557,7 @@ elif "Model" in page:
         if submitted:
             adm_row  = build_admission_features(exam_pct,gender,college,year_gap,
                                                 spec,board,caste,religion,district)
+            adm_row["fees"] = actual_fees
             inp      = pd.DataFrame([adm_row])[list(feats)]
             inps     = scaler.transform(inp)
             base_p   = float(model.predict_proba(inps)[0][1])
@@ -1645,7 +1585,7 @@ elif "Model" in page:
                    text-transform:uppercase'>{badge}</div></div>""", unsafe_allow_html=True)
 
             fig_g=go.Figure(go.Indicator(mode="gauge+number",value=final_p*100,
-                number={"suffix":"%","font":{"color":rcol,"size":38,"family":"Times New Roman"}},
+                number={"suffix":"%","font":{"color":rcol,"size":38,"family":"Arial"}},
                 gauge={"axis":{"range":[0,100],"tickcolor":GOLD},
                        "bar":{"color":rcol,"thickness":0.22},"bgcolor":"white",
                        "steps":[{"range":[0,20],"color":"#E8F5E9"},{"range":[20,40],"color":"#FFF8E1"},

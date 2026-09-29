@@ -1,0 +1,11 @@
+.venv/
+venv310/
+.uv-cache/
+__pycache__/
+.pytest_cache/
+pipeline_state/
+.build_features.py
+.integrate_pipeline.py
+.test-artifacts/
+.ipynb_checkpoints/
+*.py[cod]

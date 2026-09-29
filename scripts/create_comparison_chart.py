@@ -3,6 +3,10 @@ Create visual comparison of old vs new semester weighting
 """
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
+
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / 'reports' / 'figures'
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Setup
 semesters = [1, 2, 3, 4, 5, 6]
@@ -64,7 +68,7 @@ ax2.annotate('LOW RISK\n3.2% churn', xy=(3, 3.2), xytext=(3.5, 20),
             fontsize=10, fontweight='bold', color='#2D6A4F')
 
 plt.tight_layout()
-plt.savefig('semester_weighting_comparison.png', dpi=300, bbox_inches='tight')
+plt.savefig(OUTPUT_DIR / 'semester_weighting_comparison.png', dpi=300, bbox_inches='tight')
 print("✓ Chart saved as 'semester_weighting_comparison.png'")
 
 # Create second chart: Prediction impact
@@ -111,7 +115,7 @@ ax3.grid(True, alpha=0.3)
 ax3.axhline(y=45, color='#C8A96E', linestyle=':', linewidth=2, label='Threshold (45%)')
 
 plt.tight_layout()
-plt.savefig('prediction_impact_comparison.png', dpi=300, bbox_inches='tight')
+plt.savefig(OUTPUT_DIR / 'prediction_impact_comparison.png', dpi=300, bbox_inches='tight')
 print("✓ Chart saved as 'prediction_impact_comparison.png'")
 
 print("\n" + "="*60)
